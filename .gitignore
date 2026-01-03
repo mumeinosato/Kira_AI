@@ -5,7 +5,7 @@
 
 # Ignore environment and secrets
 .env
-.env.*
+.env
 
 # Ignore memory database and model weights
 memory_db/
@@ -26,7 +26,7 @@ __pycache__/
 
 # Ignore environment and secrets
 .env
-.env.*
+.env
 
 # Ignore memory database and model weights
 memory_db/

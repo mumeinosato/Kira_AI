@@ -3,7 +3,7 @@ transformers
 pyttsx3
 SpeechRecognition
 pyaudio
-numpy
+numpy==1.26.4
 # For GPU support, llama-cpp-python needs to be installed with specific flags.
 # Please see the installation instructions.
 llama-cpp-python
@@ -20,4 +20,8 @@ google-api-python-client
 chromadb
 sentence-transformers
 
-
+pygame
+twitchio
+edge-tts
+style-bert-vits2
+soundfile

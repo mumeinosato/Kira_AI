@@ -8,6 +8,7 @@ import pygame
 import torch
 import numpy as np
 from llama_cpp import Llama
+from sympy.physics.units import length
 from transformers import pipeline
 
 from config import (
@@ -15,7 +16,8 @@ from config import (
     LLM_MAX_RESPONSE_TOKENS,
     ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
     AZURE_SPEECH_VOICE, AZURE_PROSODY_PITCH, AZURE_PROSODY_RATE,
-    VIRTUAL_AUDIO_DEVICE, AI_NAME
+    VIRTUAL_AUDIO_DEVICE, AI_NAME, STYLE_BERT_VITS2_MODEL_PATH, STYLE_BERT_VITS2_CONFIG_PATH,
+    STYLE_BERT_VITS2_STYLE_PATH
 )
 from persona import AI_PERSONALITY_PROMPT, EmotionalState
 
@@ -27,6 +29,13 @@ except ImportError: AsyncElevenLabs = None
 try: import azure.cognitiveservices.speech as speechsdk
 except ImportError: speechsdk = None
 
+try:
+    from style_bert_vits2.nlp import bert_models
+    from style_bert_vits2.constants import Languages
+    from style_bert_vits2.tts_model import TTSModel
+    import soundfile as sf
+except ImportError:
+    TTSModel = None
 
 class AI_Core:
     def __init__(self, interruption_event):
@@ -70,15 +79,19 @@ class AI_Core:
 
     async def _init_tts(self):
         print(f"-> Initializing TTS engine: {TTS_ENGINE}...")
-        if TTS_ENGINE == "elevenlabs":
-            if not AsyncElevenLabs: raise ImportError("Run 'pip install elevenlabs'")
-            self.eleven_client = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY)
-        elif TTS_ENGINE == "azure":
-            if not speechsdk: raise ImportError("Run 'pip install azure-cognitiveservices-speech'")
-            speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-            self.azure_synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-        elif TTS_ENGINE == "edge":
-            if not Communicate: raise ImportError("Run 'pip install edge-tts'")
+        if TTS_ENGINE == "edge":
+            if not TTSModel:
+                raise ImportError("Run 'pip install style-bert-vits2'")
+
+            bert_models.load_model(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
+            bert_models.load_tokenizer(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
+
+            self.style_bert_model = TTSModel(
+                model_path=STYLE_BERT_VITS2_MODEL_PATH,
+                config_path=STYLE_BERT_VITS2_CONFIG_PATH,
+                style_vec_path=STYLE_BERT_VITS2_STYLE_PATH,
+                device="cpu"
+            )
         else:
             raise ValueError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}")
         print(f"   {TTS_ENGINE.capitalize()} TTS ready.")
@@ -145,26 +158,15 @@ class AI_Core:
         self.interruption_event.clear()
         audio_bytes = b''
         try:
-            if TTS_ENGINE == "elevenlabs":
-                # ... elevenlabs logic ...
-                pass
-            elif TTS_ENGINE == "azure":
-                ssml = (f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-                        f'<voice name="{AZURE_SPEECH_VOICE}">'
-                        f'<prosody rate="{AZURE_PROSODY_RATE}" pitch="{AZURE_PROSODY_PITCH}">{text}</prosody>'
-                        f'</voice></speak>')
-                result = await asyncio.to_thread(self.azure_synthesizer.speak_ssml, ssml)
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    audio_bytes = result.audio_data
-                else:
-                    cancellation_details = result.cancellation_details
-                    error_message = f"Azure TTS failed: {cancellation_details.reason}"
-                    if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                        error_message += f" - Details: {cancellation_details.error_details}"
-                    raise Exception(error_message)
-            elif TTS_ENGINE == "edge":
-                # ... edge logic ...
-                pass
+            if TTS_ENGINE == "edge":
+                if self.interruption_event.is_set(): return
+
+                sr, audio = await asyncio.to_thread(self.style_bert_model.infer,text=text,length=0.85)
+
+                buf = io.BytesIO()
+                sf.write(buf,audio,sr,format="WAV")
+                buf.seek(0)
+                audio_bytes = buf.getvalue()
             
             if not self.interruption_event.is_set():
                 await self._play_audio_with_pygame(audio_bytes)
