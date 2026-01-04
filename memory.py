@@ -1,6 +1,7 @@
 # memory.py - Handles long-term memory using a persistent vector database.
 
 import chromadb
+import torch
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 import os
@@ -19,7 +20,16 @@ class MemoryManager:
             settings=Settings(anonymized_telemetry=False)
         )
         self.collection = self.client.get_or_create_collection(name=collection_name)
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu') 
+
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            device = 'xpu'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+
+        #self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
         print("   Memory Manager initialized.")
 
     def add_memory(self, user_text: str, ai_text: str):

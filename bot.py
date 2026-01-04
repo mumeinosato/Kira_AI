@@ -5,9 +5,7 @@ import webrtcvad
 import collections
 import pyaudio
 import time
-import traceback
 import random
-from typing import List, Callable # Added for type hinting
 
 from ai_core import AI_Core
 from memory import MemoryManager
@@ -205,7 +203,20 @@ class VTubeBot:
             if ENABLE_PROACTIVE_THOUGHTS and is_truly_idle and not self.unseen_chat_messages and random.random() < PROACTIVE_THOUGHT_CHANCE:
                 async with self.processing_lock:
                     print("\n--- Proactive thought triggered... ---")
-                    prompt = "Generate a brief, interesting observation or a random thought."
+                    #prompt = "Generate a brief, interesting observation or a random thought."
+
+                    prompts = [
+                        "Generate a brief, interesting observation or a random thought.",
+                        "Share something that's on your mind right now.",
+                        "What would you like to talk about if you could choose any topic?",
+                        "Share a brief spontaneous thought about the current moment."
+                    ]
+                    prompt = random.choice(prompts)
+
+                    #add
+                    if random.random() < 0.3:
+                        self.current_emotion = random.choice(list(EmotionalState))
+
                     thought = await self.ai_core.llm_inference([], self.current_emotion, prompt)
                     if thought:
                         await self.process_and_respond(thought, thought, "assistant")
