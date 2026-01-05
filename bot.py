@@ -19,10 +19,12 @@ from persona import EmotionalState
 
 # Define these here since they are not in config.py
 ENABLE_PROACTIVE_THOUGHTS = True
-PROACTIVE_THOUGHT_INTERVAL = 20
+PROACTIVE_THOUGHT_INTERVAL = 10
 PROACTIVE_THOUGHT_CHANCE = 0.8
 ENABLE_WEB_SEARCH = False
 ENABLE_TWITCH_CHAT = False
+
+TRAINING_MODE=True
 
 
 class VTubeBot:
@@ -237,7 +239,6 @@ async def main():
         await bot.run()
     except asyncio.CancelledError:
         print("Main task cancelled.")
-
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     try:

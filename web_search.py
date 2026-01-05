@@ -1,42 +1,54 @@
-# web_search.py - Handles web search functionality.
+import requests
+from bs4 import BeautifulSoup
+from ollama import Client
+from config import OLLAMA_API_KEY
 
-import asyncio
-from googleapiclient.discovery import build # Requires google-api-python-client
-from config import GOOGLE_API_KEY, GOOGLE_CSE_ID
-
-def GoogleSearch(query: str, num_results: int = 3) -> str:
-    """Performs a Google search and returns formatted results."""
-    print(f"   Performing web search for: {query}")
+def custom_web_fetch(url, max_length=10000):
     try:
-        # Check if API keys are set up before building service
-        if not GOOGLE_API_KEY or GOOGLE_API_KEY.startswith("YOUR_"):
-            print("   ERROR: Google API Key not set in config.py. Web search disabled.")
-            return "Web search is not configured."
-        if not GOOGLE_CSE_ID or GOOGLE_CSE_ID.startswith("YOUR_"):
-            print("   ERROR: Google CSE ID not set in config.py. Web search disabled.")
-            return "Web search is not configured."
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
 
-        service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
-        res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=num_results).execute()
-        
-        if 'items' not in res or not res['items']:
-            return "No search results found."
+        soup = BeautifulSoup(response.content, 'html.parser')
 
-        snippets = []
-        for i, item in enumerate(res['items']):
-            # Limit snippet length for LLM context, avoid very long results
-            snippet_text = item.get('snippet', '')
-            if len(snippet_text) > 200: # Trim long snippets
-                snippet_text = snippet_text[:200] + "..."
-            snippets.append(f"[{i+1}] {item.get('title', 'No Title')}: {snippet_text}")
-        
-        return "\n".join(snippets)
+        title = soup.title.string if soup.title else ""
 
+        for script in soup(["script", "style"]):
+            script.decompose()
+        raw_text = soup.get_text()
+        content = ''.join(raw_text.split())
+
+        title_clean = ''.join(title.split())
+        if content.startswith(title_clean):
+            content = content[len(title_clean):]
+
+        if len(content) > max_length:
+            content = content[:max_length]
+
+        return {
+            'title': title,
+            'content': content,
+        }
     except Exception as e:
-        print(f"   Error during web search: {e}")
-        return "There was an error searching the web."
+        print(f"Error fetching {url}: {e}")
+        return None
 
-async def async_GoogleSearch(query: str, num_results: int = 3) -> str:
-    """Asynchronous wrapper for the Google Search function."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, GoogleSearch, query, num_results)
+async def async_GoogleSearch(query: str) -> str:
+    client = Client(
+        host='https://api.ollama.ai',
+        headers={'Authorization': f'Bearer {OLLAMA_API_KEY}'}
+    )
+
+
+    search_result = client.web_search(query)
+
+    if search_result.results:
+        first_url = search_result.results[0].url
+        full_content = custom_web_fetch(first_url, max_length=4000)
+
+        if full_content:
+            return full_content['content']
+
+    return "検索結果が見つかりませんでした"

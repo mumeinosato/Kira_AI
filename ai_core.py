@@ -24,13 +24,6 @@ from config import (
 from persona import AI_PERSONALITY_PROMPT, EmotionalState
 
 # Graceful SDK imports
-try: from edge_tts import Communicate
-except ImportError: Communicate = None
-try: from elevenlabs.client import AsyncElevenLabs
-except ImportError: AsyncElevenLabs = None
-try: import azure.cognitiveservices.speech as speechsdk
-except ImportError: speechsdk = None
-
 try:
     from style_bert_vits2.nlp import bert_models
     from style_bert_vits2.constants import Languages
@@ -48,6 +41,7 @@ class AI_Core:
         self.eleven_client = None
         self.azure_synthesizer = None
         self.vtube_client = VtubeStudioClient()
+        self._system_prompt_cache = {}
         pygame.mixer.pre_init(44100, -16, 2, 2048)
         pygame.init()
 
@@ -71,7 +65,7 @@ class AI_Core:
         print("-> Loading LLM model...")
         if not os.path.exists(LLM_MODEL_PATH):
             raise FileNotFoundError(f"LLM model not found at {LLM_MODEL_PATH}")
-        self.llm = Llama(model_path=LLM_MODEL_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS, verbose=False)
+        self.llm = Llama(model_path=LLM_MODEL_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS, n_batch=512,verbose=False)
         print("   LLM model loaded.")
 
     def _init_whisper(self):
@@ -128,7 +122,7 @@ class AI_Core:
             system_prompt += f"\n[Memory Context]:\n{memory_context}"
 
         system_tokens = self.llm.tokenize(system_prompt.encode("utf-8"))
-        
+
         # We now use the variable from config for the response buffer
         max_response_tokens = LLM_MAX_RESPONSE_TOKENS
         token_limit = N_CTX - len(system_tokens) - max_response_tokens
@@ -138,9 +132,9 @@ class AI_Core:
             print("   (Trimming conversation history to fit context window...)")
             messages.pop(0)
             history_tokens = sum(len(self.llm.tokenize(m["content"].encode("utf-8"))) for m in messages)
-            
+
         full_prompt = [{"role": "system", "content": system_prompt}] + messages
-        
+
         try:
             response = await asyncio.to_thread(
                 self.llm.create_chat_completion,
@@ -160,7 +154,7 @@ class AI_Core:
     async def analyze_emotion_of_turn(self, last_user_text: str, last_ai_response: str) -> EmotionalState | None:
         if not self.llm: return None
         emotion_names = [e.name for e in EmotionalState]
-        prompt = (f"Jonny: \"{last_user_text}\"\nKira: \"{last_ai_response}\"\n\n"
+        prompt = (f"mumeinosato: \"{last_user_text}\"\nKira: \"{last_ai_response}\"\n\n"
                   f"Based on this, which emotional state is most appropriate for Kira's next turn? "
                   f"Options: {', '.join(emotion_names)}.\n"
                   f"Respond ONLY with the single best state name (e.g., 'SASSY').")
@@ -185,25 +179,73 @@ class AI_Core:
 
         try:
             if TTS_ENGINE == "edge":
-                if self.interruption_event.is_set(): return
+                chunks = self._split_text_for_streaming(text)
+                audio_queue = asyncio.Queue(maxsize=2)
 
-                sr, audio = await asyncio.to_thread(self.style_bert_model.infer,text=text,length=0.85)
+                async def generate_audio():
+                    for chunk in chunks:
+                        if self.interruption_event.is_set():
+                            break
 
-                if VTUBESTUDIO == "true":
-                    lip_sync_data = self._generate_lip_sync(text)
+                        sr, audio = await asyncio.to_thread(self.style_bert_model.infer,text=chunk,length=0.85)
 
-                buf = io.BytesIO()
-                sf.write(buf,audio,sr,format="WAV")
-                buf.seek(0)
-                audio_bytes = buf.getvalue()
-            
-            if not self.interruption_event.is_set():
-                if VTUBESTUDIO == "true":
-                    await self._play_audio(audio_bytes, lip_sync_data=lip_sync_data)
-                else:
-                    await self._play_audio(audio_bytes)
+                        buf = io.BytesIO()
+                        sf.write(buf,audio,sr,format="WAV")
+                        buf.seek(0)
+
+                        await audio_queue.put((buf.getvalue(), chunk))
+                    await audio_queue.put(None)
+
+                async def play_audio():
+                    while True:
+                        if self.interruption_event.is_set():
+                            break
+
+                        item = await audio_queue.get()
+                        if item is None:
+                            break
+                        audio_bytes, chunk = item
+
+                        if VTUBESTUDIO == "true":
+                            lip_sync_data = self._generate_lip_sync(chunk)
+                            await self._play_audio(audio_bytes, lip_sync_data=lip_sync_data)
+                        else:
+                            await self._play_audio(audio_bytes)
+
+                await asyncio.gather(generate_audio(), play_audio())
+
         except Exception as e:
             print(f"   ERROR during TTS generation: {e}")
+
+    def _split_text_for_streaming(self, text: str, max_length: int = 50) -> list[str]:
+        import re
+
+        segments = re.split(r'([。、\n])', text)
+        chunks = []
+        current_chunk = ""
+
+        for i in range(0, len(segments), 2):
+            segment = segments[i]
+            delimiter = segments[i + 1] if i + 1 < len(segments) else ""
+
+            # セグメント + 区切り文字を追加
+            combined = segment + delimiter
+
+            if len(current_chunk) + len(combined) <= max_length:
+                current_chunk += combined
+            else:
+                # 現在のチャンクを保存
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+
+                # 新しいチャンクを開始
+                current_chunk = combined
+
+        # 最後のチャンクを追加
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        return chunks
 
     def _generate_lip_sync(self, text: str):
         phonemes = []
