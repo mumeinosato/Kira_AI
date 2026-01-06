@@ -1,58 +1,34 @@
-# ai_core.py - Core logic for the AI, including STT, LLM, and TTS.
-
 import asyncio
-import io
-import json
-import os
-import re
-import threading
-import time
-import pygame
-import torch
-import numpy as np
-import websocket
-from llama_cpp import Llama
-from transformers import pipeline
-
-from config import (
-    LLM_MODEL_PATH, N_CTX, N_GPU_LAYERS, WHISPER_MODEL_SIZE, TTS_ENGINE,
-    LLM_MAX_RESPONSE_TOKENS,
-    VIRTUAL_AUDIO_DEVICE, AI_NAME, STYLE_BERT_VITS2_MODEL_PATH, STYLE_BERT_VITS2_CONFIG_PATH,
-    STYLE_BERT_VITS2_STYLE_PATH,
-    VTUBESTUDIO
-)
-from persona import AI_PERSONALITY_PROMPT, EmotionalState
-
-# Graceful SDK imports
-try:
-    from style_bert_vits2.nlp import bert_models
-    from style_bert_vits2.constants import Languages
-    from style_bert_vits2.tts_model import TTSModel
-    import soundfile as sf
-except ImportError:
-    TTSModel = None
+from src.audio.audio_player import AudioPlayer
+from src.audio.lip_sync import generate_lip_sync, split_text_for_streaming
+from src.audio.tts_manager import TTSManager
+from src.audio.whisper_manager import WhisperManager
+from src.llm.llm_manager import LLMManager
+from src.vtube.vtube_client import VtubeStudioClient
+from config import AI_NAME, VTUBESTUDIO
+from persona import EmotionalState
 
 class AI_Core:
     def __init__(self, interruption_event):
         self.interruption_event = interruption_event
         self.is_initialized = False
-        self.llm = None
-        self.whisper = None
-        self.eleven_client = None
-        self.azure_synthesizer = None
-        self.vtube_client = VtubeStudioClient()
-        self._system_prompt_cache = {}
-        pygame.mixer.pre_init(44100, -16, 2, 2048)
-        pygame.init()
+
+        self.llm_manager = LLMManager()
+        self.whisper_manager = WhisperManager()
+        self.tts_manager = TTSManager()
+        self.audio_player = AudioPlayer(interruption_event)
+        self.vtube_client = VtubeStudioClient() if VTUBESTUDIO == "true" else None
 
     async def initialize(self):
-        """Initializes AI components sequentially to prevent resource conflicts."""
         print("-> Initializing AI Core components...")
         try:
-            await asyncio.to_thread(self._init_llm)
-            await asyncio.to_thread(self._init_whisper)
-            await self._init_tts()
-            await self._init_vtube()
+            await asyncio.to_thread(self.llm_manager.initialize)
+            await asyncio.to_thread(self.whisper_manager.initialize)
+            await self.tts_manager.initialize()
+
+            if self.vtube_client:
+                self.vtube_client.connect()
+                print("   VTube Studio client connected.")
 
             self.is_initialized = True
             print("   AI Core initialized successfully!")
@@ -61,343 +37,43 @@ class AI_Core:
             self.is_initialized = False
             raise
 
-    def _init_llm(self):
-        print("-> Loading LLM model...")
-        if not os.path.exists(LLM_MODEL_PATH):
-            raise FileNotFoundError(f"LLM model not found at {LLM_MODEL_PATH}")
-        self.llm = Llama(model_path=LLM_MODEL_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS, n_batch=512,verbose=False)
-        print("   LLM model loaded.")
-
-    def _init_whisper(self):
-        print("-> Loading Whisper STT model...")
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-            device = "xpu"  # Intel Arc GPU
-        else:
-            device = "cpu"
-        print(f"   Whisper STT will use device: {device}")
-        self.whisper = pipeline("automatic-speech-recognition", model=f"openai/whisper-{WHISPER_MODEL_SIZE}", device=device)
-        print("   Whisper STT model loaded.")
-
-    async def _init_tts(self):
-        print(f"-> Initializing TTS engine: {TTS_ENGINE}...")
-        if TTS_ENGINE == "edge":
-            if not TTSModel:
-                raise ImportError("Run 'pip install style-bert-vits2'")
-
-            bert_models.load_model(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
-            bert_models.load_tokenizer(Languages.JP, "ku-nlp/deberta-v2-large-japanese-char-wwm")
-
-            if hasattr(torch, 'xpu') and torch.xpu.is_available():
-                device = "xpu"
-                print("   Using XPU for TTS")
-            elif torch.cuda.is_available():
-                device = "cuda"
-                print("   Using CUDA for TTS")
-            else:
-                device = "cpu"
-                print("   Using CPU for TTS")
-
-            self.style_bert_model = TTSModel(
-                model_path=STYLE_BERT_VITS2_MODEL_PATH,
-                config_path=STYLE_BERT_VITS2_CONFIG_PATH,
-                style_vec_path=STYLE_BERT_VITS2_STYLE_PATH,
-                device=device
-            )
-        else:
-            raise ValueError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}")
-        print(f"   {TTS_ENGINE.capitalize()} TTS ready.")
-
-    async def _init_vtube(self):
-        if VTUBESTUDIO == "true":
-            self.vtube_client.connect()
-            print("   VTube Studio client connected.")
-
-
     async def llm_inference(self, messages: list, current_emotion: EmotionalState, memory_context: str = "") -> str:
-        system_prompt = AI_PERSONALITY_PROMPT
-        system_prompt += f"\n\n[Your current emotional state is: {current_emotion.name}. Let this state subtly influence your response style and word choice.]"
-        if memory_context and "No memories" not in memory_context:
-            system_prompt += f"\n[Memory Context]:\n{memory_context}"
+        return await self.llm_manager.inference(messages, current_emotion, memory_context)
 
-        system_tokens = self.llm.tokenize(system_prompt.encode("utf-8"))
+    async def analyze_emotion_of_turn(self, user_text: str, ai_response: str) -> EmotionalState | None:
+        return await self.llm_manager.analyze_emotion(user_text, ai_response)
 
-        # We now use the variable from config for the response buffer
-        max_response_tokens = LLM_MAX_RESPONSE_TOKENS
-        token_limit = N_CTX - len(system_tokens) - max_response_tokens
-
-        history_tokens = sum(len(self.llm.tokenize(m["content"].encode("utf-8"))) for m in messages)
-        while history_tokens > token_limit and len(messages) > 1:
-            print("   (Trimming conversation history to fit context window...)")
-            messages.pop(0)
-            history_tokens = sum(len(self.llm.tokenize(m["content"].encode("utf-8"))) for m in messages)
-
-        full_prompt = [{"role": "system", "content": system_prompt}] + messages
-
-        try:
-            response = await asyncio.to_thread(
-                self.llm.create_chat_completion,
-                messages=full_prompt,
-                # --- UPDATED: Use the new variable for max_tokens ---
-                max_tokens=LLM_MAX_RESPONSE_TOKENS,
-                temperature=0.8,
-                top_p=0.9,
-                stop=["\nJonny:", "\nKira:", "</s>"]
-            )
-            raw_text = response['choices'][0]['message']['content']
-            return self._clean_llm_response(raw_text)
-        except Exception as e:
-            print(f"   ERROR during LLM inference: {e}")
-            return "Oops, my brain just short-circuited. What were we talking about?"
-
-    async def analyze_emotion_of_turn(self, last_user_text: str, last_ai_response: str) -> EmotionalState | None:
-        if not self.llm: return None
-        emotion_names = [e.name for e in EmotionalState]
-        prompt = (f"mumeinosato: \"{last_user_text}\"\nKira: \"{last_ai_response}\"\n\n"
-                  f"Based on this, which emotional state is most appropriate for Kira's next turn? "
-                  f"Options: {', '.join(emotion_names)}.\n"
-                  f"Respond ONLY with the single best state name (e.g., 'SASSY').")
-        try:
-            response = await asyncio.to_thread(
-                self.llm, prompt=prompt, max_tokens=10, temperature=0.2, stop=["\n", ".", ","]
-            )
-            text_response = response['choices'][0]['text'].strip().upper()
-            for emotion in EmotionalState:
-                if emotion.name in text_response:
-                    return emotion
-            return None
-        except Exception as e:
-            print(f"   ERROR during emotion analysis: {e}")
-            return None
+    async def transcribe_audio(self, audio_data: bytes) -> str:
+        return await self.whisper_manager.transcribe(audio_data)
 
     async def speak_text(self, text: str):
-        if not text: return
+        if not text:
+            return
         print(f"<<< {AI_NAME} says: {text}")
         self.interruption_event.clear()
-        audio_bytes = b''
 
         try:
-            if TTS_ENGINE == "edge":
-                chunks = self._split_text_for_streaming(text)
-                audio_queue = asyncio.Queue(maxsize=2)
+            chunks = split_text_for_streaming(text)
+            audio_queue = asyncio.Queue(maxsize=2)
 
-                async def generate_audio():
-                    for chunk in chunks:
+            async def generate_audio():
+                for chunk in chunks:
+                    if self.interruption_event.is_set():
+                        break
+
+                    #audio_bytes = await self.tts_manager.generate_speech(chunk)
+                    async for audio_chunk in self.tts_manager.generate_speech(chunk):
                         if self.interruption_event.is_set():
                             break
+                        lip_sync_data = generate_lip_sync(chunk) if VTUBESTUDIO == "true" else None
+                        await audio_queue.put((audio_chunk, lip_sync_data))
 
-                        sr, audio = await asyncio.to_thread(self.style_bert_model.infer,text=chunk,length=0.85)
+                await audio_queue.put(None)
 
-                        buf = io.BytesIO()
-                        sf.write(buf,audio,sr,format="WAV")
-                        buf.seek(0)
-
-                        await audio_queue.put((buf.getvalue(), chunk))
-                    await audio_queue.put(None)
-
-                async def play_audio():
-                    while True:
-                        if self.interruption_event.is_set():
-                            break
-
-                        item = await audio_queue.get()
-                        if item is None:
-                            break
-                        audio_bytes, chunk = item
-
-                        if VTUBESTUDIO == "true":
-                            lip_sync_data = self._generate_lip_sync(chunk)
-                            await self._play_audio(audio_bytes, lip_sync_data=lip_sync_data)
-                        else:
-                            await self._play_audio(audio_bytes)
-
-                await asyncio.gather(generate_audio(), play_audio())
+            await asyncio.gather(
+                generate_audio(),
+                self.audio_player.stream_audio(audio_queue, self.vtube_client)
+            )
 
         except Exception as e:
             print(f"   ERROR during TTS generation: {e}")
-
-    def _split_text_for_streaming(self, text: str, max_length: int = 50) -> list[str]:
-        import re
-
-        segments = re.split(r'([。、\n])', text)
-        chunks = []
-        current_chunk = ""
-
-        for i in range(0, len(segments), 2):
-            segment = segments[i]
-            delimiter = segments[i + 1] if i + 1 < len(segments) else ""
-
-            # セグメント + 区切り文字を追加
-            combined = segment + delimiter
-
-            if len(current_chunk) + len(combined) <= max_length:
-                current_chunk += combined
-            else:
-                # 現在のチャンクを保存
-                if current_chunk.strip():
-                    chunks.append(current_chunk.strip())
-
-                # 新しいチャンクを開始
-                current_chunk = combined
-
-        # 最後のチャンクを追加
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-
-        return chunks
-
-    def _generate_lip_sync(self, text: str):
-        phonemes = []
-        for char in text.lower():
-            if char in "aeiou":
-                phonemes.append({"time": 0.1, "mouth_open": 0.8})
-            elif char in "bcdfghjklmnpqrstvwxyz":
-                phonemes.append({"time": 0.05, "mouth_open": 0.2})
-            else:
-                phonemes.append({"time": 0.05, "mouth_open": 0.0})
-        return phonemes
-
-    async def _play_audio(self, audio_bytes: bytes, lip_sync_data=None):
-        if self.interruption_event.is_set() or not audio_bytes:
-            return
-
-        try:
-            pygame.mixer.init(devicename=VIRTUAL_AUDIO_DEVICE)
-            if pygame.mixer.get_busy():
-                pygame.mixer.stop()
-            sound = pygame.mixer.Sound(io.BytesIO(audio_bytes))
-            channel = sound.play()
-
-            if lip_sync_data:
-                # リップシンクデータがある場合
-                start_time = time.time()
-                for phoneme in lip_sync_data:
-                    if self.interruption_event.is_set():
-                        channel.stop()
-                        break
-
-                    elapsed = time.time() - start_time
-                    if elapsed >= phoneme["time"]:
-                        self.vtube_client.send_lip_sync({
-                            "jaw_open": phoneme["mouth_open"]
-                        })
-
-                    await asyncio.sleep(0.01)
-
-                self.vtube_client.send_lip_sync({"jaw_open": 0})
-
-            # 音声再生が終了するまで待機
-            while channel.get_busy():
-                if self.interruption_event.is_set():
-                    channel.stop()
-                    break
-                await asyncio.sleep(0.1)
-        finally:
-            if pygame.mixer.get_init():
-                pygame.mixer.quit()
-
-    def _clean_llm_response(self, text: str) -> str:
-        text = re.sub(r'^\s*Kira:\s*', '', text, flags=re.MULTILINE | re.IGNORECASE)
-        text = text.replace('</s>', '').strip()
-        text = text.replace('*', '')
-        return text
-
-    async def transcribe_audio(self, audio_data: bytes) -> str:
-        arr = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        result = await asyncio.to_thread(self.whisper, arr)
-        return result.get("text", "").strip()
-
-class VtubeStudioClient:
-    def __init__(self):
-        self.ws = None
-        self.connected = False
-        self.authenticated = False
-
-    def connect(self):
-        self.ws = websocket.WebSocketApp(
-            "ws://localhost:8001",
-            on_message=self.on_message,
-            on_open=self.on_open,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        wst = threading.Thread(target=self.ws.run_forever)
-        wst.daemon = True
-        wst.start()
-
-    def on_message(self, ws, message):
-        print(f"Received message: {message}")
-        data = json.loads(message)
-        if data.get("messageType") == "AuthenticationTokenResponse":
-            token = data["data"]["authenticationToken"]
-            self.authenticate(token)
-        elif data.get("messageType") == "AuthenticationResponse":
-            if data["data"].get("authenticated"):
-                print("Authentication successful!")
-                self.authenticated = True
-            else:
-                print("Authentication failed.")
-
-    def on_open(self, ws):
-        print("WebSocket connection opened.")
-        self.connected = True
-        self.request_authentication_token()
-
-    def on_error(self, ws, error):
-        print(f"WebSocket error: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        print("WebSocket connection closed.")
-        self.connected = False
-
-    def request_authentication_token(self):
-        if not self.connected:
-            print("WebSocket is not connected. Cannot send authentication token request.")
-            return
-
-        message = {
-            "apiName": "VTubeStudioPublicAPI",
-            "apiVersion": "1.0",
-            "requestID": "authToken",
-            "messageType": "AuthenticationTokenRequest",
-            "data": {
-                "pluginName": "YourPluginName",
-                "pluginDeveloper": "YourName"
-            }
-        }
-        self.ws.send(json.dumps(message))
-
-    def authenticate(self, token):
-        message = {
-            "apiName": "VTubeStudioPublicAPI",
-            "apiVersion": "1.0",
-            "requestID": "authRequest",
-            "messageType": "AuthenticationRequest",
-            "data": {
-                "authenticationToken": token,
-                "pluginName": "YourPluginName",
-                "pluginDeveloper": "YourName"
-            }
-        }
-        self.ws.send(json.dumps(message))
-
-    def send_lip_sync(self,phonemes_with_timing):
-        if self.connected and self.ws:
-            message = {
-                "apiName": "VTubeStudioPublicAPI",
-                "apiVersion": "1.0",
-                "requestID": "inject-open",
-                "messageType": "InjectParameterDataRequest",
-                "data": {
-                    "faceFound": False,
-                    "mode": "set",
-                    "parameterValues": [
-                        {
-                            "id": "MouthOpen",
-                            "value": phonemes_with_timing.get("smile", 0)
-                        }
-                    ]
-                }
-            }
-            self.ws.send(json.dumps(message))

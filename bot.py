@@ -8,8 +8,8 @@ import time
 import random
 
 from ai_core import AI_Core
-from memory import MemoryManager
-from summarizer import SummarizationManager
+from src.memory.memory import MemoryManager
+from src.memory.summarizer import SummarizationManager
 from twitch_bot import TwitchBot
 from web_search import async_GoogleSearch
 from config import (

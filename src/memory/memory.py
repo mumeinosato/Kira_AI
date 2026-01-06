@@ -1,5 +1,3 @@
-# memory.py - Handles long-term memory using a persistent vector database.
-
 import chromadb
 import torch
 from chromadb.config import Settings
@@ -14,7 +12,7 @@ class MemoryManager:
         print("-> Initializing Memory Manager...")
         if not os.path.exists(MEMORY_PATH):
             os.makedirs(MEMORY_PATH)
-            
+
         self.client = chromadb.PersistentClient(
             path=MEMORY_PATH,
             settings=Settings(anonymized_telemetry=False)
@@ -42,7 +40,7 @@ class MemoryManager:
                 ],
                 documents=[user_text, ai_text],
                 metadatas=[
-                    {"role": "user", "timestamp": time.time(), "type": "turn"}, 
+                    {"role": "user", "timestamp": time.time(), "type": "turn"},
                     {"role": "assistant", "timestamp": time.time(), "type": "turn"}
                 ],
                 ids=[str(uuid.uuid4()), str(uuid.uuid4())]
@@ -73,7 +71,7 @@ class MemoryManager:
                 n_results=min(n_results, self.collection.count()),
                 include=['documents', 'metadatas']
             )
-            
+
             formatted_results = []
             if results and results['documents'] and results['documents'][0]:
                 for i, doc in enumerate(results['documents'][0]):
@@ -83,7 +81,7 @@ class MemoryManager:
                     else:
                         role = meta.get('role', 'unknown').capitalize()
                         formatted_results.append(f"[{role}]: {doc}")
-            
+
             return "\n- ".join(formatted_results) if formatted_results else "No highly relevant memories found."
         except Exception as e:
             print(f"   ERROR: Failed to search memories: {e}")
