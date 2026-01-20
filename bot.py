@@ -61,7 +61,6 @@ class VTubeBot:
 
     async def _main_loop(self):
         """Contains the primary startup and listening logic."""
-        #修正中
         try:
             await self.ai_core.initialize()
             if not self.ai_core.is_initialized: return
