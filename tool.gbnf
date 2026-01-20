@@ -1,0 +1,12 @@
+root ::= (chunk ws)*
+
+chunk ::= speak | vision | minecraft | text
+
+speak ::= "<speak>" chars "</speak>"
+vision ::= "<vision>" chars "</vision>"
+minecraft ::= "<minecraft>" chars "</minecraft>"
+
+text ::= chars
+
+chars ::= ([^<] | "<" [^/])*
+ws ::= [ \n\r\t]*

@@ -2,6 +2,20 @@ import requests
 from bs4 import BeautifulSoup
 from ollama import Client
 from config import OLLAMA_API_KEY
+from src.tools.base_tool import BaseTool
+
+
+class WebSearchTool(BaseTool):
+    @property
+    def name(self) -> str:
+        return "web_search"
+
+    @property
+    def description(self) -> str:
+        return "Search the web for current information"
+
+    async def execute(self, query: str, **kwargs) -> str:\
+        return await async_GoogleSearch(query)
 
 def custom_web_fetch(url, max_length=10000):
     try:

@@ -18,6 +18,8 @@ class LLMManager:
             n_ctx=N_CTX,
             n_gpu_layers=N_GPU_LAYERS,
             n_batch=512,
+            kv_type="q4_0",
+            flash_attn=True,
             verbose=False
         )
         print("   LLM model loaded.")

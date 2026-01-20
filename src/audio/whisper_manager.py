@@ -26,5 +26,5 @@ class WhisperManager:
 
     async def transcribe(self, audio_data: bytes) -> str:
         arr = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        result = await asyncio.to_thread(self.whisper, arr)
+        result = await asyncio.to_thread(self.whisper, arr,generate_kwargs={"language": "ja", "task": "transcribe"})
         return result.get("text", "").strip()

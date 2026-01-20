@@ -10,8 +10,8 @@ import random
 from ai_core import AI_Core
 from src.memory.memory import MemoryManager
 from src.memory.summarizer import SummarizationManager
+from src.tools import register_default_tools
 from twitch_bot import TwitchBot
-from web_search import async_GoogleSearch
 from config import (
     AI_NAME, PAUSE_THRESHOLD, VAD_AGGRESSIVENESS
 )
@@ -47,6 +47,8 @@ class VTubeBot:
         self.unseen_chat_messages = []
         self.current_emotion = EmotionalState.HAPPY
         self.last_idle_chat = "" # Track the last idle chat summary
+
+        #register_default_tools(self.ai_core.llm_manager.tool_registry)
 
     def reset_idle_timer(self):
         self.last_interaction_time = time.time()
@@ -156,7 +158,13 @@ class VTubeBot:
 
         mem_ctx = self.memory.search_memories(original_text, n_results=3)
         response = await self.ai_core.llm_inference(self.conversation_history, self.current_emotion, mem_ctx)
-        
+
+        if isinstance(response, str) and "「" in response and "」" in response:
+            start = response.find("「")
+            end = response.find("」", start + 1)
+            if end != -1:
+                response = response[start + 1:end]
+
         if response:
             await self.ai_core.speak_text(response)
             self.conversation_history.append({"role": "assistant", "content": response})
