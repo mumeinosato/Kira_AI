@@ -61,6 +61,24 @@ class MemoryManager:
         except Exception as e:
             print(f"   ERROR: Failed to add summarized memory: {e}")
 
+    def add_knowledge(self, content: str, source: str = "web_search"):
+        """Adds external knowledge to the memory."""
+        try:
+            # Simple chunking if the content is very long
+            max_chunk_size = 1000
+            chunks = [content[i:i+max_chunk_size] for i in range(0, len(content), max_chunk_size)]
+            
+            for chunk in chunks:
+                self.collection.add(
+                    embeddings=[self.embedding_model.encode(chunk).tolist()],
+                    documents=[chunk],
+                    metadatas=[{"role": "knowledge", "timestamp": time.time(), "type": "knowledge", "source": source}],
+                    ids=[str(uuid.uuid4())]
+                )
+            print(f"   ✅ Knowledge Added from {source} ({len(chunks)} chunks)")
+        except Exception as e:
+            print(f"   ERROR: Failed to add knowledge: {e}")
+
     def search_memories(self, query_text: str, n_results: int = 5) -> str:
         """Searches for memories semantically similar to the query text."""
         if self.collection.count() == 0:
@@ -76,11 +94,15 @@ class MemoryManager:
             if results and results['documents'] and results['documents'][0]:
                 for i, doc in enumerate(results['documents'][0]):
                     meta = results['metadatas'][0][i]
-                    if meta.get('type') == 'summary':
-                        formatted_results.append(f"[Key Memory]: {doc}")
+                    mem_type = meta.get('type', 'turn')
+                    
+                    if mem_type == 'summary':
+                        formatted_results.append(f"[過去の要約]: {doc}")
+                    elif mem_type == 'knowledge':
+                        formatted_results.append(f"[外部知識]: {doc}")
                     else:
                         role = meta.get('role', 'unknown').capitalize()
-                        formatted_results.append(f"[{role}]: {doc}")
+                        formatted_results.append(f"[{role}の過去の発言]: {doc}")
 
             return "\n- ".join(formatted_results) if formatted_results else "No highly relevant memories found."
         except Exception as e:

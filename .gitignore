@@ -33,3 +33,7 @@ venv/
 # Downloaded LLM models (can be very large)
 models/
 *.gguf
+
+plan.txt
+system_prompt.txt
+implementation_plan.md

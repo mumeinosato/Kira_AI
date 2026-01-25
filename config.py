@@ -17,9 +17,6 @@ VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", 3))
 MEMORY_PATH = os.getenv("MEMORY_PATH", "memory_db/")
 
 # Secrets and API keys (must be in .env, never commit real values)
-TWITCH_OAUTH_TOKEN = os.getenv("TWITCH_OAUTH_TOKEN", "")
-TWITCH_BOT_USERNAME = os.getenv("TWITCH_BOT_USERNAME", "")
-TWITCH_CHANNEL_TO_JOIN = os.getenv("TWITCH_CHANNEL_TO_JOIN", "")
 #VIRTUAL_AUDIO_DEVICE = os.getenv("VIRTUAL_AUDIO_DEVICE", None)
 VIRTUAL_AUDIO_DEVICE = None
 
@@ -29,3 +26,7 @@ STYLE_BERT_VITS2_STYLE_PATH = os.getenv("STYLE_BERT_VITS2_STYLE_PATH", "")
 
 VTUBESTUDIO = os.getenv("VTUBESTUDIO", "false")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+LIVE_ID = os.getenv("LIVE_ID", "")
+ENABLE_YOUTUBE_COMMENTS = os.getenv("ENABLE_YOUTUBE_COMMENTS", "false")

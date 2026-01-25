@@ -5,11 +5,11 @@ import os
 def load_personality_prompt():
     """Loads the personality prompt from the text file."""
     try:
-        with open("kira_personality.txt", "r", encoding="utf-8") as f:
+        with open("system_prompt.txt", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        print("FATAL: kira_personality.txt not found. Please ensure the file exists.")
-        return "You are a helpful assistant." # Fallback prompt
+        print("FATAL: system_prompt.txt not found. Please ensure the file exists.")
+        return "You are a Kira, a human-like AI VTuber." # Fallback prompt
 
 from enum import Enum
 

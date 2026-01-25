@@ -1,12 +1,19 @@
 root ::= (chunk ws)*
 
-chunk ::= speak | vision | minecraft | text
+chunk ::= thought | speak | wait | tool
 
+thought ::= "<thought>" chars "</thought>"
 speak ::= "<speak>" chars "</speak>"
-vision ::= "<vision>" chars "</vision>"
-minecraft ::= "<minecraft>" chars "</minecraft>"
+wait ::= "<wait" ws "time=" "\"" ([0-9]+) "\"" ws "/>"
 
-text ::= chars
+tool ::= toolsc | toolcont | toolargsc | toolargcont
 
-chars ::= ([^<] | "<" [^/])*
+toolsc ::= "<tool" ws "name=" "\"" namechars "\"" ws "/>"
+toolcont ::= "<tool" ws "name=" "\"" namechars "\"" ws ">" chars "</tool>"
+toolargsc ::= "<tool" ws "name=" "\"" namechars "\"" ws "args=" "\"" attrchars "\"" ws "/>"
+toolargcont ::= "<tool" ws "name=" "\"" namechars "\"" ws "args=" "\"" attrchars "\"" ws ">" chars "</tool>"
+
+namechars ::= [a-zA-Z0-9_]+
+attrchars ::= [^"<>]*
+chars ::= [^<]*
 ws ::= [ \n\r\t]*

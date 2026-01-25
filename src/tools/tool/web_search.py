@@ -14,8 +14,12 @@ class WebSearchTool(BaseTool):
     def description(self) -> str:
         return "Search the web for current information"
 
-    async def execute(self, query: str, **kwargs) -> str:\
-        return await async_GoogleSearch(query)
+    async def execute(self, query: str, memory_manager=None, **kwargs) -> str:
+        result = await async_GoogleSearch(query)
+        if result and "検索結果が見つかりませんでした" not in result and memory_manager:
+            # Store search result as knowledge
+            memory_manager.add_knowledge(result, source=f"web_search:{query}")
+        return result
 
 def custom_web_fetch(url, max_length=10000):
     try:

@@ -1,40 +1,50 @@
 # bot.py - Main application file with advanced memory and web search.
 
+import os
+import sys
+import logging
+
+# Aggressively silence Style-Bert-VITS2 logs and loguru BEFORE any other imports
+os.environ["LOGURU_LEVEL"] = "ERROR"
+logging.disable(logging.WARNING)
+try:
+    from loguru import logger
+    logger.remove()
+except ImportError:
+    pass
+
 import asyncio
 import webrtcvad
 import collections
 import pyaudio
 import time
-import random
 
 from ai_core import AI_Core
 from src.memory.memory import MemoryManager
 from src.memory.summarizer import SummarizationManager
-from src.tools import register_default_tools
-from twitch_bot import TwitchBot
 from config import (
-    AI_NAME, PAUSE_THRESHOLD, VAD_AGGRESSIVENESS
+    AI_NAME, PAUSE_THRESHOLD, VAD_AGGRESSIVENESS, ENABLE_YOUTUBE_COMMENTS, YOUTUBE_API_KEY, LIVE_ID
 )
-from persona import EmotionalState
 
-# Define these here since they are not in config.py
 ENABLE_PROACTIVE_THOUGHTS = True
-PROACTIVE_THOUGHT_INTERVAL = 10
-PROACTIVE_THOUGHT_CHANCE = 0.8
 ENABLE_WEB_SEARCH = False
-ENABLE_TWITCH_CHAT = False
-
-TRAINING_MODE=True
+ENABLE_VAD = False
 
 
 class VTubeBot:
     def __init__(self):
         self.interruption_event = asyncio.Event()
         self.processing_lock = asyncio.Lock()
-        self.ai_core = AI_Core(self.interruption_event)
         self.memory = MemoryManager()
+        self.ai_core = AI_Core(self.interruption_event, memory_manager=self.memory)
         self.summarizer = SummarizationManager(self.ai_core, self.memory)
         self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        
+        # Brain Components
+        from src.brain.ai_state import AIState
+        from src.brain.director import Director
+        self.ai_state = AIState()
+        self.director = Director()
         
         self.last_interaction_time = time.time()
         self.pyaudio_instance = None
@@ -44,20 +54,22 @@ class VTubeBot:
         self.bg_tasks = set() # Use a set for easier task management
         self.conversation_history = []
         self.conversation_segment = []
-        self.unseen_chat_messages = []
-        self.current_emotion = EmotionalState.HAPPY
-        self.last_idle_chat = "" # Track the last idle chat summary
+        
+        # YouTube comment manager
+        self.youtube_comment_manager = None
+        if ENABLE_YOUTUBE_COMMENTS == "true" and YOUTUBE_API_KEY and LIVE_ID:
+            from src.tools.tool.youtube import YoutubeCommentManager, YoutubeCommentTool
+            self.youtube_comment_manager = YoutubeCommentManager(YOUTUBE_API_KEY, LIVE_ID)
+            self.ai_core.tool_registry.register(YoutubeCommentTool(self.youtube_comment_manager))
+            print("-> YouTube comment feature enabled.")
 
-        #register_default_tools(self.ai_core.llm_manager.tool_registry)
+        #register_default_tools(self.ai_core.tool_registry)
 
     def reset_idle_timer(self):
         self.last_interaction_time = time.time()
 
     async def run(self):
-        # --- UPDATED: Moved main logic into a separate task for graceful shutdown ---
-        main_task = asyncio.create_task(self._main_loop())
-        self.bg_tasks.add(main_task)
-        await main_task
+        await self._main_loop()
 
     async def _main_loop(self):
         """Contains the primary startup and listening logic."""
@@ -72,17 +84,24 @@ class VTubeBot:
             )
 
             print(f"\n--- {AI_NAME} is now running. Press Ctrl+C to exit. ---\n")
-            # Do NOT trigger any speech or response at startup
-
-            if ENABLE_TWITCH_CHAT:
-                twitch_bot = TwitchBot(self.unseen_chat_messages, self.reset_idle_timer)
-                twitch_task = asyncio.create_task(twitch_bot.start())
-                self.bg_tasks.add(twitch_task)
             
             background_task = asyncio.create_task(self.background_loop())
             self.bg_tasks.add(background_task)
+ 
+            conversation_task = asyncio.create_task(self.conversation_loop())
+            self.bg_tasks.add(conversation_task)
+            
+            # Start YouTube comment polling if enabled
+            if self.youtube_comment_manager:
+                youtube_task = asyncio.create_task(self.youtube_comment_manager.start_polling())
+                self.bg_tasks.add(youtube_task)
 
-            await self.vad_loop()
+            if ENABLE_VAD:
+                await self.vad_loop()
+            else:
+                # Keep active even without VAD to maintain conversation and youtube polling
+                while True:
+                    await asyncio.sleep(1)
         except asyncio.CancelledError:
             print("Main loop cancelled.")
         finally:
@@ -92,6 +111,7 @@ class VTubeBot:
             print("--- Cleanup complete. ---")
 
 
+    ##マイクからの音声入力処理
     async def vad_loop(self):
         # This function's logic remains the same
         frames = collections.deque()
@@ -126,7 +146,7 @@ class VTubeBot:
                         self.bg_tasks.add(task)
                         task.add_done_callback(self.bg_tasks.discard)
 
-
+    ##音声データをテキストに変換し、応答を生成
     async def handle_audio(self, audio_data: bytes):
         async with self.processing_lock:
             user_text = await self.ai_core.transcribe_audio(audio_data)
@@ -138,99 +158,185 @@ class VTubeBot:
             if any(h["content"] == user_text for h in self.conversation_history):
                 print(f"(Duplicate input ignored: {user_text})")
                 return
+            
+            # User input triggers state update
+            self.ai_state.update(0, event="got_reaction")
+            
             contextual_prompt = f"Jonny says: \"{user_text}\""
+            # Process as a user reaction action
+            await self.process_and_respond(user_text, contextual_prompt, "user", temperature=0.7)
+
+    async def process_and_respond(self, original_text: str, contextual_prompt: str, role: str, system_directive: str = "", temperature: float = 0.7, mode: str = "monologue"):
+
+        if original_text:
+            self.conversation_history.append({"role": role, "content": original_text})
+            self.conversation_segment.append({"role": role, "content": original_text})
+
+        # Keep history concise to prevent obsessive repetition or getting stuck in the past
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+
+        # Search memory more broadly if there is no user text
+        search_query = original_text if original_text else (contextual_prompt if contextual_prompt else "Kiraの趣味や最近の出来事")
+        mem_ctx = self.memory.search_memories(search_query, n_results=5) 
+        # Prepare messages for LLM
+        messages = list(self.conversation_history)
+        
+        # Add YouTube comment hint if comments are available
+        # AND Override system_directive to prioritize comment response
+        if self.youtube_comment_manager and self.youtube_comment_manager.has_comments():
+            comment_count = self.youtube_comment_manager.get_comment_count()
+            comment_hint = f"[視聴者のコメント]: 現在{comment_count}件のコメントがあります。`<tool name=\"youtube_comment\"/>`を使ってコメントを取得し、視聴者と対話してください。"
+            messages.append({"role": "system", "content": comment_hint})
             
-            if self.unseen_chat_messages:
-                chat_summary = "\n- ".join(self.unseen_chat_messages)
-                contextual_prompt += (
-                    f"\n\nWhile you were listening, your Twitch chat said:\n- {chat_summary}\n\n"
-                    f"Give a single, natural response that addresses Jonny and also acknowledges the chat if it makes sense."
-                )
-                self.unseen_chat_messages.clear()
+            # FORCE override directive to ensure AI focuses on comments
+            system_directive = "視聴者からコメントが来ています。自分の話はいったん止めて、必ず `youtube_comment` ツールを使ってコメントを読み、返事をしてあげてください。"
+        
+        if system_directive:
+            # Check if last action was a tool call
+            if self.conversation_history and "(Called a tool" in self.conversation_history[-1]["content"]:
+                # If we just used a tool, FORCE the AI to speak about it, instead of calling another tool
+                system_directive = "ツールで得た情報について、あなた自身の感想や驚きをリスナーに話してください。再度ツールを使う必要はありません。"
             
-            await self.process_and_respond(user_text, contextual_prompt, "user")
+            # Shift from "Instruction" to a more persona-friendly "Situation"
+            messages.append({"role": "system", "content": f"[Current Situation/Idea]: {system_directive}"})
 
-    async def process_and_respond(self, original_text: str, contextual_prompt: str, role: str):
-        print(f"   (Kira's current emotion is: {self.current_emotion.name})")
+        # Use streaming inference with GBNF tags
+        from src.utils.exceptions import SafetyViolationError
+        try:
+            response = await self.ai_core.generate_and_process_stream(
+                messages, 
+                mem_ctx,
+                temperature=temperature
+            )
+            
+            if response:
+                # Store spoken text for display/TTL
+                spoken_text = self.ai_core.extract_speak_text(response)
+                
+                # Store the internal state (especially tools) as a system-like hint or assistant history
+                # But we need the LLM to know it just used a tool.
+                if spoken_text:
+                    self.conversation_history.append({"role": "assistant", "content": spoken_text})
+                    self.conversation_segment.append({"role": "assistant", "content": spoken_text})
+                elif "<tool" in response:
+                    # If it only used a tool, we still need to record that it responded with SOMETHING
+                    # so the history moves forward.
+                    self.conversation_history.append({"role": "assistant", "content": "(Called a tool to research something)"})
+                
+                if role == "user" and original_text:
+                     self.memory.add_memory(user_text=original_text, ai_text=spoken_text if spoken_text else response)
 
-        self.conversation_history.append({"role": role, "content": original_text})
-        self.conversation_segment.append({"role": role, "content": original_text})
-
-        mem_ctx = self.memory.search_memories(original_text, n_results=3)
-        response = await self.ai_core.llm_inference(self.conversation_history, self.current_emotion, mem_ctx)
-
-        if isinstance(response, str) and "「" in response and "」" in response:
-            start = response.find("「")
-            end = response.find("」", start + 1)
-            if end != -1:
-                response = response[start + 1:end]
-
-        if response:
-            await self.ai_core.speak_text(response)
-            self.conversation_history.append({"role": "assistant", "content": response})
-            self.conversation_segment.append({"role": "assistant", "content": response})
-            if role == "user":
-                 self.memory.add_memory(user_text=original_text, ai_text=response)
-            await self.update_emotional_state(original_text, response)
+        except SafetyViolationError as e:
+            print(f"   [GENERATION STOPPED]: {e.reason}")
+            # Do NOT retry. Just stop this turn.
+            # Optionally add a system note to history so LLM knows why it stopped?
+            # self.conversation_history.append({"role": "system", "content": f"[System]: 前回の発言はフィルターにより中断されました（理由: {e.reason}）。"})
+            return
+        
+        # --- NEW: Correction Loop for Missing Speech ---
+        # If we had a thought but NO speech (and no tool call), force a short follow-up.
+        if response and "<thought>" in response and not self.ai_core.extract_speak_text(response) and "<tool" not in response:
+             print("   [Correction]: Detected thought without speech. Triggering follow-up...")
+             
+             # Add the thought to history so the AI knows it just thought that.
+             # We want to persist this specific internal monologue only for this immediate correction context.
+             # Actually, simpler: Just ask it to speak what it thought.
+             
+             correction_directive = "直前の思考（thought）を声に出して（speak）言ってください。"
+             
+             # Append a temporary system message to force output
+             messages.append({"role": "assistant", "content": response}) # Assume it 'happened' internally
+             messages.append({"role": "system", "content": correction_directive})
+             
+             try:
+                 print("   [Correction]: meaningful silence recovery...")
+                 retry_response = await self.ai_core.generate_and_process_stream(
+                    messages, 
+                    mem_ctx, 
+                    temperature=0.7
+                 )
+                 # Update history if successful
+                 if retry_response:
+                     spoken = self.ai_core.extract_speak_text(retry_response)
+                     if spoken:
+                         self.conversation_history.append({"role": "assistant", "content": spoken})
+                         self.conversation_segment.append({"role": "assistant", "content": spoken})
+             except Exception as e:
+                 print(f"   [Correction Failed]: {e}")
         
         self.reset_idle_timer()
 
-    async def update_emotional_state(self, user_text, ai_response):
-        new_emotion = await self.ai_core.analyze_emotion_of_turn(user_text, ai_response)
-        if new_emotion and new_emotion != self.current_emotion:
-            print(f"   ✨ Emotion state changing from {self.current_emotion.name} to {new_emotion.name}")
-            self.current_emotion = new_emotion
-        elif random.random() < 0.1:
-            if self.current_emotion != EmotionalState.HAPPY:
-                 print(f"   ✨ Emotion state resetting to HAPPY")
-            self.current_emotion = EmotionalState.HAPPY
+
+
+    async def conversation_loop(self):
+        """
+        Main autonomous loop. The AI should speak sequentially.
+        """
+        print("-> Conversation loop started.")
+        while True:
+            if self.processing_lock.locked():
+                await asyncio.sleep(0.1)
+                continue
+ 
+            # Sequential Turn logic:
+            # If we are here, nothing else is talking.
+            async with self.processing_lock:
+                # 1. Update State
+                idle_time = time.time() - self.last_interaction_time
+                self.ai_state.update(idle_time)
+                
+                # 2. Gather Context
+                context = {
+                    "has_comments": self.youtube_comment_manager and self.youtube_comment_manager.has_comments(),
+                    "idle_time": idle_time,
+                    "recent_topics": self.ai_state.topics_discussed
+                }
+                
+                # 3. Decide Action
+                action = self.director.decide_action(self.ai_state, context)
+                
+                if action.mode.value == "wait":
+                    await asyncio.sleep(5.0)
+                    continue
+                
+                print(f"-> Starting organic turn (Mode: {action.mode.value}, Temp: {action.temperature:.2f})")
+                
+                # 4. Execute
+                await self.process_and_respond(
+                    "", 
+                    action.directive, 
+                    "assistant", 
+                    system_directive=action.directive,
+                    temperature=action.temperature,
+                    mode=action.mode.value
+                )
+                
+                # 5. Feedback
+                if action.mode.value == "boke":
+                    self.ai_state.update(0, event="boke")
+                elif action.mode.value == "monologue":
+                    self.ai_state.update(0, event="monologue")
+                    if action.topic_hint:
+                        self.ai_state.change_topic(action.topic_hint)
+                else:
+                    self.ai_state.update(0, event="spoke")
+                
+                self.director.record_action(action)
+   
+            # Loop delay: give more breath between turns
+            await asyncio.sleep(10.0)
+  
+            # Loop delay: give more breath between turns
+            await asyncio.sleep(10.0)
 
     async def background_loop(self):
+        # We can keep this for summary tasks or other non-conversation background work.
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             
             if self.processing_lock.locked():
                 continue
-
-            # Task 1: Read chat during shorter lulls
-            is_chat_lull = (time.time() - self.last_interaction_time) > 5.0
-            if is_chat_lull and self.unseen_chat_messages:
-                async with self.processing_lock:
-                    print("\n--- Responding to idle chat... ---")
-                    chat_summary = "\n- ".join(self.unseen_chat_messages)
-                    if chat_summary != self.last_idle_chat:  # Only respond to new summaries
-                        chat_prompt = (
-                            "You've been quiet for a moment. Briefly react to these recent messages from your Twitch chat:\n- " 
-                            + chat_summary
-                        )
-                        self.unseen_chat_messages.clear()
-                        await self.process_and_respond(f"[Idle Twitch Chat]: {chat_summary}", chat_prompt, "user")
-                        self.last_idle_chat = chat_summary  # Update the last idle chat summary
-                    continue
-
-            # Task 2: Proactive thoughts ONLY during long periods of total silence.
-            is_truly_idle = (time.time() - self.last_interaction_time) > PROACTIVE_THOUGHT_INTERVAL
-            if ENABLE_PROACTIVE_THOUGHTS and is_truly_idle and not self.unseen_chat_messages and random.random() < PROACTIVE_THOUGHT_CHANCE:
-                async with self.processing_lock:
-                    print("\n--- Proactive thought triggered... ---")
-                    #prompt = "Generate a brief, interesting observation or a random thought."
-
-                    prompts = [
-                        "Generate a brief, interesting observation or a random thought.",
-                        "Share something that's on your mind right now.",
-                        "What would you like to talk about if you could choose any topic?",
-                        "Share a brief spontaneous thought about the current moment."
-                    ]
-                    prompt = random.choice(prompts)
-
-                    #add
-                    if random.random() < 0.3:
-                        self.current_emotion = random.choice(list(EmotionalState))
-
-                    thought = await self.ai_core.llm_inference([], self.current_emotion, prompt)
-                    if thought:
-                        await self.process_and_respond(thought, thought, "assistant")
-                        continue
 
             # Task 3: Summarize conversation
             if len(self.conversation_segment) >= 8:
@@ -259,7 +365,7 @@ if __name__ == "__main__":
         for task in tasks:
             task.cancel()
         
-        # Gather all cancelled tasks to let them finish
+        # Gather all canceled tasks to let them finish
         group = asyncio.gather(*tasks, return_exceptions=True)
         loop.run_until_complete(group)
         loop.close()
